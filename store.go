@@ -9,26 +9,44 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
 	_ "modernc.org/sqlite"
 )
 
 const userLabelRunes = 60
 
-type Call struct {
-	At     time.Time
-	Input  int
-	Output int
-	Label  string
-	Tool   bool
+type Step struct {
+	Seq     int
+	At      time.Time
+	Input   int
+	Output  int
+	Label   string
+	Tool    string
+	IsError bool
+	Final   bool
+	Waste   bool
+}
+
+type Request struct {
+	Seq       int
+	At        time.Time
+	User      string
+	Reply     string
+	Input     int
+	Output    int
+	Failed    bool
+	Heartbeat bool
+	Steps     []Step
 }
 
 type Session struct {
-	Key    string
-	ID     string
-	Latest time.Time
-	Calls  []Call
+	Key      string
+	ID       string
+	Latest   time.Time
+	Requests []Request
 }
 
 func (s Session) DisplayKey() string {
@@ -43,6 +61,39 @@ func (s Session) DisplayKey() string {
 		return s.ID[:8]
 	}
 	return s.ID
+}
+
+func (s Session) Waste() int {
+	n := 0
+	for _, req := range s.Requests {
+		for _, step := range req.Steps {
+			if step.Waste {
+				n += step.Input
+			}
+		}
+	}
+	return n
+}
+
+func (s Session) Input() int {
+	n := 0
+	for _, req := range s.Requests {
+		n += req.Input
+	}
+	return n
+}
+
+func (s Session) visible(showHeartbeat bool) []Request {
+	if showHeartbeat {
+		return s.Requests
+	}
+	out := make([]Request, 0, len(s.Requests))
+	for _, req := range s.Requests {
+		if !req.Heartbeat {
+			out = append(out, req)
+		}
+	}
+	return out
 }
 
 func transcriptPaths() ([]string, error) {
@@ -139,19 +190,14 @@ func loadDB(path string) ([]Session, error) {
 
 	var sessions []Session
 	for _, id := range ids {
-		calls, latest, err := loadCalls(db, id)
+		session, err := loadSession(db, id, keys[id])
 		if err != nil {
 			return nil, err
 		}
-		if len(calls) == 0 {
+		if session.ID == "" {
 			continue
 		}
-		sessions = append(sessions, Session{
-			Key:    keys[id],
-			ID:     id,
-			Latest: latest,
-			Calls:  calls,
-		})
+		sessions = append(sessions, session)
 	}
 	return sessions, nil
 }
@@ -171,14 +217,22 @@ type eventRow struct {
 	CreatedAt int64
 }
 
-func loadCalls(db *sql.DB, sessionID string) ([]Call, time.Time, error) {
+var zdec = func() *zstd.Decoder {
+	dec, err := zstd.NewReader(nil)
+	if err != nil {
+		panic(err)
+	}
+	return dec
+}()
+
+func loadSession(db *sql.DB, sessionID, key string) (Session, error) {
 	rows, err := db.Query(`
-		SELECT seq, event_json, created_at
+		SELECT seq, event_json, event_zstd, created_at
 		FROM transcript_events
-		WHERE session_id = ? AND event_json IS NOT NULL
+		WHERE session_id = ?
 		ORDER BY seq`, sessionID)
 	if err != nil {
-		return nil, time.Time{}, err
+		return Session{}, err
 	}
 	defer rows.Close()
 
@@ -186,37 +240,62 @@ func loadCalls(db *sql.DB, sessionID string) ([]Call, time.Time, error) {
 	for rows.Next() {
 		var row eventRow
 		var raw sql.NullString
+		var blob []byte
 		var created sql.NullInt64
-		if err := rows.Scan(&row.Seq, &raw, &created); err != nil {
-			return nil, time.Time{}, err
+		if err := rows.Scan(&row.Seq, &raw, &blob, &created); err != nil {
+			return Session{}, err
 		}
-		if !raw.Valid || raw.String == "" {
+		if raw.Valid && raw.String != "" {
+			row.Raw = raw.String
+		} else if len(blob) > 0 {
+			plain, err := zdec.DecodeAll(blob, nil)
+			if err != nil {
+				continue
+			}
+			row.Raw = string(plain)
+		} else {
 			continue
 		}
-		row.Raw = raw.String
 		if created.Valid {
 			row.CreatedAt = created.Int64
 		}
 		events = append(events, row)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, time.Time{}, err
+		return Session{}, err
 	}
-	calls := callsFromEvents(events)
+	reqs := requestsFromEvents(events)
+	if len(reqs) == 0 {
+		return Session{}, nil
+	}
 	var latest time.Time
-	for _, call := range calls {
-		if call.At.After(latest) {
-			latest = call.At
+	for _, req := range reqs {
+		if req.At.After(latest) {
+			latest = req.At
+		}
+		for _, step := range req.Steps {
+			if step.At.After(latest) {
+				latest = step.At
+			}
 		}
 	}
-	return calls, latest, nil
+	return Session{Key: key, ID: sessionID, Latest: latest, Requests: reqs}, nil
 }
 
-func callsFromEvents(events []eventRow) []Call {
-	var calls []Call
-	var userText string
-	var runID string
-	inRun := false
+func requestsFromEvents(events []eventRow) []Request {
+	var reqs []Request
+	var cur *Request
+
+	flush := func() {
+		if cur == nil {
+			return
+		}
+		finishRequest(cur)
+		if cur.User != "" || len(cur.Steps) > 0 {
+			reqs = append(reqs, *cur)
+		}
+		cur = nil
+	}
 
 	for _, event := range events {
 		msg, ok := decodeMessage(event.Raw)
@@ -225,32 +304,82 @@ func callsFromEvents(events []eventRow) []Call {
 		}
 		switch msg.Role {
 		case "user":
-			userText = cleanText(textFromContent(msg.Content))
-		case "assistant":
-			at := msg.when(event.CreatedAt)
-			label := ""
-			tool := false
-			if inRun && msg.RunID != "" && msg.RunID == runID {
-				label = toolFromContent(msg.Content)
-				if label == "" && msg.StopReason != "" && msg.StopReason != "stop" {
-					label = msg.StopReason
-				}
-				tool = true
-			} else {
-				label = clip(userText, userLabelRunes)
-				runID = msg.RunID
-				inRun = true
+			flush()
+			text := cleanText(textFromContent(msg.Content))
+			cur = &Request{
+				Seq:       event.Seq,
+				At:        msg.when(event.CreatedAt),
+				User:      text,
+				Heartbeat: isHeartbeat(text),
 			}
-			calls = append(calls, Call{
-				At:     at,
+		case "assistant":
+			if cur == nil {
+				cur = &Request{Seq: event.Seq, At: msg.when(event.CreatedAt)}
+			}
+			step := Step{
+				Seq:    event.Seq,
+				At:     msg.when(event.CreatedAt),
 				Input:  msg.Input,
 				Output: msg.Output,
-				Label:  label,
-				Tool:   tool,
+				Tool:   toolLabel(msg.Content),
+				Final:  msg.StopReason == "stop",
+			}
+			cur.Steps = append(cur.Steps, step)
+			if step.Final {
+				cur.Reply = cleanText(textFromContent(msg.Content))
+			}
+		case "toolResult":
+			if cur == nil {
+				continue
+			}
+			errText := toolError(msg.Content)
+			if errText == "" {
+				continue
+			}
+			cur.Failed = true
+			cur.Steps = append(cur.Steps, Step{
+				Seq:     event.Seq,
+				At:      msg.when(event.CreatedAt),
+				Label:   clip(errText, 160),
+				IsError: true,
 			})
 		}
 	}
-	return calls
+	flush()
+	return reqs
+}
+
+func finishRequest(req *Request) {
+	var calls []int
+	for i, step := range req.Steps {
+		if step.IsError {
+			continue
+		}
+		calls = append(calls, i)
+		req.Input += step.Input
+		req.Output += step.Output
+		if step.Output <= 3 {
+			req.Steps[i].Waste = true
+		}
+	}
+	if len(calls) == 0 {
+		return
+	}
+	req.Steps[calls[0]].Label = clip(req.User, userLabelRunes)
+	for _, i := range calls[1:] {
+		req.Steps[i].Label = req.Steps[i].Tool
+	}
+	last := calls[len(calls)-1]
+	if len(calls) > 1 && req.Steps[last].Final && req.Reply != "" {
+		req.Steps[last].Label = clip(req.Reply, userLabelRunes)
+	}
+	if req.At.IsZero() {
+		req.At = req.Steps[calls[0]].At
+	}
+}
+
+func isHeartbeat(user string) bool {
+	return strings.Contains(strings.ToLower(user), "openclaw heartbeat")
 }
 
 type decodedMessage struct {
@@ -259,7 +388,6 @@ type decodedMessage struct {
 	StopReason string
 	Input      int
 	Output     int
-	RunID      string
 	Stamp      time.Time
 }
 
@@ -281,9 +409,6 @@ func decodeMessage(raw string) (decodedMessage, bool) {
 				Output flexInt `json:"output"`
 			} `json:"usage"`
 			Timestamp json.RawMessage `json:"timestamp"`
-			OpenClaw  struct {
-				RunID string `json:"runId"`
-			} `json:"__openclaw"`
 		} `json:"message"`
 	}
 	if err := json.Unmarshal([]byte(raw), &ev); err != nil || ev.Message == nil {
@@ -294,7 +419,6 @@ func decodeMessage(raw string) (decodedMessage, bool) {
 		Role:       msg.Role,
 		Content:    msg.Content,
 		StopReason: msg.StopReason,
-		RunID:      msg.OpenClaw.RunID,
 		Stamp:      parseStamp(msg.Timestamp),
 	}
 	if msg.Usage != nil {
@@ -328,20 +452,92 @@ func textFromContent(raw json.RawMessage) string {
 	return b
 }
 
-func toolFromContent(raw json.RawMessage) string {
+func toolLabel(raw json.RawMessage) string {
 	var parts []struct {
-		Type string `json:"type"`
-		Name string `json:"name"`
+		Type      string          `json:"type"`
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
 	}
 	if json.Unmarshal(raw, &parts) != nil {
 		return ""
 	}
 	for _, part := range parts {
-		if part.Type == "toolCall" && part.Name != "" {
-			return part.Name
+		if part.Type != "toolCall" || part.Name == "" {
+			continue
 		}
+		name := part.Name
+		args := part.Arguments
+		if name == "tool_call" || name == "tool_describe" {
+			var inner struct {
+				ID   string          `json:"id"`
+				Args json.RawMessage `json:"args"`
+			}
+			if json.Unmarshal(args, &inner) == nil && inner.ID != "" {
+				name = inner.ID
+				if len(inner.Args) > 0 {
+					args = inner.Args
+				}
+			}
+		}
+		if arg := pickArg(args); arg != "" {
+			return name + "  " + arg
+		}
+		return name
 	}
 	return ""
+}
+
+func pickArg(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var fields map[string]any
+	if json.Unmarshal(raw, &fields) != nil {
+		return ""
+	}
+	for _, key := range []string{"query", "url", "path"} {
+		value, ok := fields[key].(string)
+		if !ok || value == "" {
+			continue
+		}
+		value = cleanText(value)
+		if key == "query" {
+			return key + `="` + clip(value, userLabelRunes) + `"`
+		}
+		return key + "=" + clip(value, 80)
+	}
+	return ""
+}
+
+func toolError(raw json.RawMessage) string {
+	text := strings.TrimSpace(textFromContent(raw))
+	if text == "" {
+		return ""
+	}
+	var wrap struct {
+		Status string          `json:"status"`
+		Error  json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal([]byte(text), &wrap) != nil || wrap.Status != "error" {
+		return ""
+	}
+	var msg string
+	if json.Unmarshal(wrap.Error, &msg) != nil {
+		msg = string(wrap.Error)
+	}
+	return cleanText(unwrapExternal(msg))
+}
+
+func unwrapExternal(s string) string {
+	const marker = "---\n"
+	const end = "<<<END_EXTERNAL_UNTRUSTED_CONTENT"
+	if i := strings.LastIndex(s, marker); i >= 0 {
+		s = s[i+len(marker):]
+	}
+	if j := strings.Index(s, end); j >= 0 {
+		s = s[:j]
+	}
+	return strings.TrimSpace(s)
 }
 
 type flexInt int
